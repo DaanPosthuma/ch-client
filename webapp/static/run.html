@@ -1,0 +1,71 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Run ROMs &mdash; clickhouse-dev</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<nav>
+    <span class="brand">clickhouse-dev</span>
+    <a href="/">Story</a>
+    <a href="/run" class="active">Run ROMs</a>
+    <a href="/explore">Explore DB</a>
+</nav>
+<main class="wide">
+    <h1>Run ROMs</h1>
+    <p class="subtitle">Every frame here is a real <code>INSERT INTO chip8.state SELECT ch8_run_batch(...)</code>
+        against the live ClickHouse server &mdash; the CPU is entirely SQL, this page just drives timing and renders pixels.</p>
+
+    <div class="panel row">
+        <label>ROM: <select id="rom-select"></select></label>
+        <button id="new-run" class="primary">New run</button>
+        <span class="badge" id="run-badge">no run yet</span>
+    </div>
+
+    <div class="grid-run">
+        <div class="col">
+            <canvas id="display-canvas" width="640" height="320"></canvas>
+            <div class="row">
+                <button id="play-pause" disabled>&#9654; Play</button>
+                <button id="step-once" disabled>Step 1 instr</button>
+                <label>speed <input id="speed" type="range" min="1" max="20" value="8" style="width:100px"></label>
+                <span class="badge" id="speed-label">8 cycles/tick</span>
+            </div>
+            <h3>Keypad</h3>
+            <div class="keypad" id="keypad"></div>
+            <p style="font-size:12px;color:var(--text-dim)">Physical keys: <code>1234 / QWER / ASDF / ZXCV</code> map to the CHIP-8 keypad.</p>
+        </div>
+
+        <div class="col">
+            <div class="panel">
+                <h3 style="margin-top:0">CPU state</h3>
+                <div class="row" style="margin-bottom:10px">
+                    <span class="badge">step <span id="s-step">-</span></span>
+                    <span class="badge">pc <span id="s-pc">-</span></span>
+                    <span class="badge">opcode <span id="s-op">-</span></span>
+                    <span class="badge">I <span id="s-i">-</span></span>
+                    <span class="badge">SP <span id="s-sp">-</span></span>
+                    <span class="badge">DT <span id="s-dt">-</span></span>
+                    <span class="badge">ST <span id="s-st">-</span></span>
+                </div>
+                <div class="reg-grid" id="reg-grid"></div>
+            </div>
+            <div class="panel">
+                <div class="row" style="justify-content:space-between">
+                    <h3 style="margin:0">Execution trace</h3>
+                    <button id="refresh-trace">Refresh</button>
+                </div>
+                <div style="max-height:360px;overflow:auto;margin-top:8px">
+                    <table id="trace-table">
+                        <thead><tr><th>step</th><th>pc</th><th>opcode</th><th>pixels on</th><th>dt</th><th>st</th></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+<script src="/static/run.js"></script>
+</body>
+</html>

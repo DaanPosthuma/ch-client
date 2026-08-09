@@ -1,0 +1,153 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Building a ClickHouse Dev Environment (and a CHIP-8 emulator in SQL)</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<nav>
+    <span class="brand">clickhouse-dev</span>
+    <a href="/" class="active">Story</a>
+    <a href="/run">Run ROMs</a>
+    <a href="/explore">Explore DB</a>
+</nav>
+<main>
+    <h1>Building a ClickHouse dev container&mdash;then a CHIP-8 emulator in pure SQL</h1>
+    <p class="subtitle">A walkthrough of everything in this environment: the container, the ClickHouse build,
+        the bugs we hit along the way, and the emulator that turned into the main event.</p>
+
+    <h2>1. The dev container</h2>
+    <p>Everything here runs inside a single Docker container (<code>clickhouse-dev</code>), built from a
+        Dockerfile that layers on top of Ubuntu 24.04: Clang&nbsp;21, a pinned Rust nightly toolchain,
+        Node.js + the Claude Code CLI, and a pile of quality-of-life tools (<code>gdb</code>, <code>clangd</code>,
+        <code>mold</code>, <code>ripgrep</code>/<code>fd</code>/<code>bat</code>/<code>fzf</code>/<code>git-delta</code>,
+        tmux, htop, neovim, uv). Two named Docker volumes back it: one for <code>/workspace</code> (the ClickHouse
+        checkout and this project), one for <code>/home/dev</code> (so tool configs and command history survive
+        container rebuilds).</p>
+    <p>The compiler choice mattered more than expected&mdash;more on that below.</p>
+
+    <h2>2. Building ClickHouse from source</h2>
+    <p>The goal was a Debug build (for testing/debugging) and a RelWithDebInfo build (for actually running
+        things at usable speed), both from a from-scratch clone with submodules.</p>
+
+    <h3>GCC turned out to be a dead end</h3>
+    <p>The original plan was the latest GCC. Partway through, ClickHouse's own build docs revealed that as of
+        early 2026 the project <strong>dropped GCC support entirely</strong>&mdash;only Clang 21+ is supported now.
+        So the container ended up with Clang 21 as the primary compiler, with GCC available separately for other
+        projects.</p>
+
+    <h3>A Rust toolchain, for a C++ database</h3>
+    <p>ClickHouse vendors a handful of components in Rust (via the <a href="https://github.com/corrosion-rs/corrosion">corrosion</a>
+        CMake integration): <code>delta-kernel-rs</code> for Delta Lake support, a PRQL compiler, and
+        <code>skim</code> for the fuzzy history search in <code>clickhouse-client</code>. The build pins an exact
+        nightly toolchain in <code>rust/vendor.sh</code>, which had to be installed via <code>rustup</code> before
+        CMake configure would succeed.</p>
+
+    <div class="callout bug">
+        <strong>Bug #1&mdash;io_uring blocked by Docker's seccomp profile.</strong>
+        The Debug unit test binary aborted immediately on startup with <code>assertion failed: !r</code> inside
+        <code>contrib/silk/src/fibers/fiber.cpp</code>, at a call to <code>io_uring_queue_init_params</code>.
+        Docker's default seccomp profile blocks the <code>io_uring_*</code> syscalls (a hardening measure against
+        several past kernel CVEs), and ClickHouse's vendored <code>silk</code> fiber scheduler hard-requires it.
+        The WSL2 kernel (6.6.87) supported io_uring fine&mdash;this was purely a container syscall filter. Fixed
+        with <code>security_opt: [seccomp:unconfined]</code> in <code>docker-compose.yml</code>, a deliberate
+        trade-off for a single-user local dev container.
+    </div>
+
+    <h3>Building</h3>
+    <p>Both builds used Ninja + ccache (tuned up to an 80&nbsp;GB cache) with lld as the linker:</p>
+    <pre><code>CC=clang-21 CXX=clang++-21 cmake -G Ninja -D CMAKE_BUILD_TYPE=Debug ..
+ninja clickhouse unit_tests_dbms</code></pre>
+    <p>The Debug build produced a 6.7&nbsp;GB <code>clickhouse</code> binary and a 6&nbsp;GB
+        <code>unit_tests_dbms</code>; RelWithDebInfo (<code>-O2/-O3 -g -DNDEBUG</code>) came in at 4.8&nbsp;GB.</p>
+
+    <h2>3. Running the test suite&mdash;and finding a real upstream bug</h2>
+    <p>The unit test binary is a single process running 27,428 gtest cases. One of them,
+        <code>UniqueKeyProbeTest.NewestLiveWinsOverOlder</code>, aborted the entire process outright.</p>
+    <div class="callout bug">
+        <strong>Bug #2&mdash;a genuine ClickHouse bug, not ours.</strong>
+        Under gdb, the crash traced to <code>DB::abortOnFailedAssertion</code> with the message
+        <code>"UNIQUE KEY probe invariant violated: key at batch row {} is live in more than one part"</code>&mdash;an
+        internal <code>chassert</code> invariant (only compiled into Debug builds) failing inside a brand-new,
+        actively-developed "unique key" feature. We'd cloned the literal tip of ClickHouse's dev branch, one day old.
+        Rather than block the whole run on someone else's WIP bug, a small wrapper script
+        (<code>run_unit_tests.sh</code>) runs the suite, detects a process abort, identifies the offending test
+        from the log, adds it to a <code>--gtest_filter</code> exclusion, and restarts&mdash;repeating until a run
+        finishes clean.
+    </div>
+    <p>Final result: <strong>27,427 tests ran, 22,684 passed, 0 failed</strong>, 4,743 skipped (mostly tests needing
+        <code>CAP_SYS_NICE</code>, unavailable in an unprivileged container), 3 intentionally disabled
+        microbenchmarks, and the one pre-excluded upstream bug.</p>
+
+    <h2>4. A Python client, managed with uv</h2>
+    <p>A small project (<code>ch-client</code>) was set up with <code>uv init</code> / <code>uv add</code>, using
+        <code>clickhouse-connect</code> against the RelWithDebInfo server. Eight pytest tests cover connectivity,
+        DDL/DML round-trips, aggregates, parameterized queries, and error handling&mdash;all passing against the
+        real, locally-built server.</p>
+
+    <h2>5. A CHIP-8 emulator, running entirely as SQL</h2>
+    <p>This is the part that took the environment somewhere unplanned. ClickHouse isn't an imperative language:
+        no stored procedures, no <code>WITH RECURSIVE</code>, no loops. Emulating a CPU means finding a way to
+        express fetch&ndash;decode&ndash;execute as SQL expressions.</p>
+
+    <h3>The architecture</h3>
+    <p>CPU state (4096-byte memory, 16 registers, <code>I</code>, <code>PC</code>, a 16-level stack, timers, a
+        64&times;32 display, 16 keys, and an RNG seed) is a single ClickHouse <code>Tuple</code>. A SQL
+        <code>CREATE FUNCTION ch8_step(state) -&gt; state</code> decodes one opcode and returns the next state.
+        The trick that makes it a real CPU rather than a one-shot function is
+        <code>arrayFold</code>&mdash;ClickHouse's array left-fold&mdash;which runs <code>ch8_step</code> N times
+        inside a <em>single SQL query</em>:</p>
+    <pre><code>CREATE FUNCTION ch8_run_batch AS (s, cycles) ->
+    ch8_tick_timers(arrayFold((acc, x) -> ch8_step(acc), range(cycles), s));</code></pre>
+    <p>Every batch of cycles is one <code>INSERT INTO chip8.state SELECT ...</code>, and the state table is an
+        <strong>append-only log</strong>&mdash;one row per batch, ordered by <code>(run_id, step_id)</code>. The
+        entire execution history of any run is sitting there as ordinary rows, queryable with plain SQL (see the
+        Explore tab). It felt like the natural way to do this in an OLAP database rather than fighting it.</p>
+
+    <div class="callout warn">
+        <strong>Pitfall&mdash;<code>WITH</code>/subqueries inside a UDF break under <code>arrayFold</code>.</strong>
+        The first version of <code>ch8_step</code> used a <code>WITH ... SELECT</code> block for readability
+        (binding <code>mem</code>, <code>pc</code>, <code>op</code>, etc. as local names). Called directly it
+        worked fine. Called from inside <code>arrayFold</code>'s lambda, it failed with
+        <code>Not found column acc in block</code>&mdash;the subquery loses access to the enclosing lambda's
+        accumulator variable entirely. The fix: no <code>WITH</code> anywhere in the CPU logic. Instead, expensive
+        derived values are computed once and threaded down as explicit function arguments&mdash;the SQL-UDF
+        equivalent of a <code>let</code>-binding.
+    </div>
+    <div class="callout warn">
+        <strong>Pitfall&mdash;chaining UDF calls directly explodes the query plan.</strong>
+        ClickHouse UDFs (<code>CREATE FUNCTION</code>) are macro-expanded at each call site, not opaquely
+        compiled. Nesting <code>ch8_step(ch8_step(s0))</code> (or aliasing intermediate results with
+        <code>WITH s1 AS ch8_step(s0)</code> and calling <code>ch8_step(s1)</code>) substitutes the entire
+        already-expanded expression tree at every reference&mdash;size multiplies at each level, and hit
+        ClickHouse's <code>Query tree is too big. Maximum: 500000</code> limit after just two steps. Chaining
+        <em>must</em> go through <code>arrayFold</code>, a real runtime loop that compiles the lambda once and
+        applies it repeatedly&mdash;never through direct nesting or named intermediate results outside of it.
+    </div>
+
+    <h3>Opcode coverage</h3>
+    <p>All 35 standard CHIP-8 opcodes are implemented: control flow (<code>JP</code>/<code>CALL</code>/<code>RET</code>,
+        conditional skips), the full <code>8XY_</code> ALU family, sprite drawing with XOR/collision and edge
+        clipping, the keypad, timers, BCD conversion, and the block memory ops. A few spec ambiguities were
+        resolved toward the common modern default (SCHIP-style in-place <code>SHR</code>/<code>SHL</code>,
+        <code>I</code> left unchanged by <code>FX55</code>/<code>FX65</code>).</p>
+
+    <h3>Validation</h3>
+    <p>Rather than trust the SQL by itself, a throwaway reference implementation in plain Python was used to
+        cross-check pixel-for-pixel against the <a href="https://github.com/Timendus/chip8-test-suite">Timendus
+        chip8-test-suite</a> ROMs. The <code>2-ibm-logo.ch8</code> test renders correctly, and
+        <code>3-corax+.ch8</code>&mdash;the standard opcode-correctness suite&mdash;shows a checkmark next to
+        every single tested opcode, no crosses:</p>
+    <p><img src="/static/corax.png" alt="corax+ opcode test results, all checkmarks" style="max-width:100%;border-radius:8px;border:1px solid var(--border)"></p>
+
+    <h2>6. This web app</h2>
+    <p>A small FastAPI service (also running in the container, port 8000) ties it together: this page, an
+        interactive <a href="/run">ROM runner</a> that steps the emulator frame-by-frame and renders the live
+        display, and a <a href="/explore">database explorer</a> for querying <code>chip8.state</code> directly
+        and browsing the <code>ch8_*</code> function source.</p>
+
+    <footer>Built inside <code>clickhouse-dev</code> &middot; ClickHouse 26.8.1.1 &middot; Clang 21</footer>
+</main>
+</body>
+</html>
